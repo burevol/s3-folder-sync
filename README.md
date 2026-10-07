@@ -23,10 +23,12 @@ S3-совместимым сервисом (MinIO, Ceph RGW, AWS S3): endpoint �
 | `s3_sync.py` | сам скрипт, зависимость только `boto3` |
 | `s3-sync.conf.example` | пример конфигурации, копируется в `s3-sync.conf` |
 | `requirements.txt` | зависимости (`boto3`, `tomli` для Python < 3.11) |
+| `requirements-dev.txt` | зависимости для разработки и CI (`coverage`) |
+| `.coveragerc` | настройки измерения покрытия и порог |
 | `tests/test_sync.py` | сквозные тесты (запускают скрипт отдельным процессом) |
 | `tests/fake_s3.py` | мини-S3 на стандартной библиотеке для тестов |
 | `LICENSE` | лицензия MIT |
-| `.github/workflows/tests.yml` | CI: тесты на Python 3.9, 3.11 и 3.13 |
+| `.github/workflows/tests.yml` | CI: тесты и покрытие на Python 3.9, 3.11 и 3.13 |
 
 ## Установка
 
@@ -377,6 +379,53 @@ python -m venv .venv
 и 3.13 при каждом push и pull request — вместе с проверкой, что скрипт
 запускается и что `s3-sync.conf.example` остаётся корректным TOML. Никаких
 секретов для CI не нужно: используется локальный мини-S3.
+
+### Покрытие тестами
+
+Тесты запускают `s3_sync.py` отдельным процессом, а `coverage run` измеряет только
+тот процесс, который запустили. Поэтому обычный замер показал бы по скрипту ноль:
+coverage нужно поднимать и в дочерних интерпретаторах.
+
+```bash
+python -m pip install -r requirements-dev.txt
+
+# хук, который выполнится при старте любого нового интерпретатора
+SITE="$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+echo 'import coverage; coverage.process_startup()' > "$SITE/coverage-subprocess.pth"
+
+export COVERAGE_PROCESS_START="$PWD/.coveragerc"
+python -m coverage run -m unittest discover -s tests
+python -m coverage combine
+python -m coverage report -m            # гейт: ниже fail_under — ошибка
+python -m coverage html -d htmlcov      # подробный отчёт для просмотра
+```
+
+В Windows те же команды идут через `.venv\Scripts\python.exe`, а переменная
+задаётся как `$env:COVERAGE_PROCESS_START = "$PWD\.coveragerc"`.
+
+Что настроено в [`.coveragerc`](.coveragerc): `branch = True` (учитываются
+ветвления), `parallel = True` (каждый процесс пишет свой файл данных, потом их
+склеивает `combine`), `include = s3_sync.py` (в проценты попадает только сам
+продукт — код тестов исполняется всегда и завышал бы картину) и `fail_under = 75`
+(порог гейта; фактическое покрытие на момент добавления — 78%).
+
+В CI отчёт печатается в лог и в сводку прогона, HTML и XML выкладываются
+артефактом `coverage-python-<версия>` (14 дней), а шаг «Отчёт о покрытии и порог»
+падает, если покрытие ушло ниже порога.
+
+### Публикация покрытия в Codecov
+
+Внешний сервис подключается без правки workflow:
+
+1. зарегистрировать репозиторий на [codecov.io](https://about.codecov.io/);
+2. добавить секрет `CODECOV_TOKEN` (Settings → Secrets and variables → Actions →
+   Secrets);
+3. добавить переменную `CODECOV_ENABLED = true` (там же, вкладка Variables).
+
+После этого включается шаг публикации: отчёты уходят с флагами
+`python-3.9`/`python-3.11`/`python-3.13`, и Codecov объединяет их в один. Пока
+переменной нет, шаг пропускается — прогон не зависит от доступности стороннего
+сервиса, а `fail_ci_if_error: false` не даёт CI упасть из-за проблем с загрузкой.
 
 Дополнительно всё проверено на реальном бакете Спринтбокса: загрузка (в том числе
 multipart для файла 12 МБ), повторный запуск без изменений, обновление файла по

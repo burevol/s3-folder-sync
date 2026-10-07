@@ -10,3 +10,11 @@ __pycache__/
 s3-sync.conf
 credentials
 *.credentials
+
+# Отчёты покрытия тестами
+.coverage
+.coverage.*
+coverage.xml
+coverage.txt
+htmlcov/
+
