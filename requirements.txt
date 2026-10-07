@@ -1,2 +1,2 @@
-boto3>=1.28
+boto3>=1.43.105
 tomli>=2.4.1; python_version < "3.11"
