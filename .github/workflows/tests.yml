@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.11", "3.13"]
+        python-version: ["3.10", "3.11", "3.13"]
     steps:
       - name: Получение кода
         uses: actions/checkout@v7
@@ -47,7 +47,7 @@ jobs:
           python - <<'PY'
           try:
               import tomllib as toml
-          except ModuleNotFoundError:  # Python 3.9/3.10
+          except ModuleNotFoundError:  # Python 3.10
               import tomli as toml
           from pathlib import Path
 
