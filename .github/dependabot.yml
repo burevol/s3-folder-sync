@@ -1,0 +1,51 @@
+# Настройки Dependabot: обновление зависимостей и версий экшенов.
+# Справочник опций: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+# Безопасность (алерты и security updates) включается в настройках репозитория и
+# этого файла не требует.
+
+version: 2
+updates:
+  # Python-зависимости: requirements.txt и requirements-dev.txt в корне репозитория.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Europe/Moscow
+    open-pull-requests-limit: 5
+    cooldown:
+      # Не хватать релиз в первые дни после выхода.
+      default-days: 7
+    groups:
+      # boto3, botocore и s3transfer связаны диапазонами версий — обновляем одним PR.
+      boto3-stack:
+        patterns:
+          - boto3
+          - botocore
+          - s3transfer
+      dev-tools:
+        patterns:
+          - coverage
+    labels:
+      - dependencies
+    assignees:
+      - burevol
+    commit-message:
+      prefix: deps
+
+  # Версии actions/* и codecov/codecov-action, используемые в workflow.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - ci
+    assignees:
+      - burevol
+    commit-message:
+      prefix: ci
