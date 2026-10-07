@@ -1,0 +1,12 @@
+# Локальные артефакты
+__pycache__/
+*.py[cod]
+.deps/
+.venv/
+.test-tmp/
+*.log
+
+# Реальные конфиги и ключи — в репозиторий не попадают
+s3-sync.conf
+credentials
+*.credentials
