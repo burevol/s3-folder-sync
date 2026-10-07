@@ -1,0 +1,58 @@
+name: Тесты
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - name: Получение кода
+        uses: actions/checkout@v7
+
+      - name: Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Скрипт запускается и печатает справку
+        run: python s3_sync.py --help > /dev/null
+
+      - name: Пример конфигурации — корректный TOML
+        run: |
+          python - <<'PY'
+          try:
+              import tomllib as toml
+          except ModuleNotFoundError:  # Python 3.9/3.10
+              import tomli as toml
+          from pathlib import Path
+
+          data = toml.loads(Path("s3-sync.conf.example").read_text(encoding="utf-8"))
+          assert "storage" in data and "folders" in data, "в примере нет [storage] или [[folders]]"
+          print("s3-sync.conf.example разобран успешно")
+          PY
+
+      - name: Тесты
+        run: python -m unittest discover -s tests -v

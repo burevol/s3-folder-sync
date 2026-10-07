@@ -1,5 +1,8 @@
 # s3-folder-sync — синхронизация папок с S3 (Спринтбокс)
 
+[![Тесты](https://github.com/burevol/s3-folder-sync/actions/workflows/tests.yml/badge.svg)](https://github.com/burevol/s3-folder-sync/actions/workflows/tests.yml)
+[![Лицензия: MIT](https://img.shields.io/badge/%D0%BB%D0%B8%D1%86%D0%B5%D0%BD%D0%B7%D0%B8%D1%8F-MIT-blue.svg)](LICENSE)
+
 `s3_sync.py` — один Python-скрипт, который приводит содержимое S3-бакета в
 соответствие с набором локальных папок, перечисленных в конфигурационном файле:
 
@@ -22,6 +25,8 @@ S3-совместимым сервисом (MinIO, Ceph RGW, AWS S3): endpoint �
 | `requirements.txt` | зависимости (`boto3`, `tomli` для Python < 3.11) |
 | `tests/test_sync.py` | сквозные тесты (запускают скрипт отдельным процессом) |
 | `tests/fake_s3.py` | мини-S3 на стандартной библиотеке для тестов |
+| `LICENSE` | лицензия MIT |
+| `.github/workflows/tests.yml` | CI: тесты на Python 3.9, 3.11 и 3.13 |
 
 ## Установка
 
@@ -367,6 +372,12 @@ python -m venv .venv
 отсутствующая папка), `--check` при неверном бакете и недоступном endpoint,
 запрет вложенных префиксов и multipart-загрузка больших файлов.
 
+Тот же набор тестов прогоняется в GitHub Actions
+([`.github/workflows/tests.yml`](.github/workflows/tests.yml)) на Python 3.9, 3.11
+и 3.13 при каждом push и pull request — вместе с проверкой, что скрипт
+запускается и что `s3-sync.conf.example` остаётся корректным TOML. Никаких
+секретов для CI не нужно: используется локальный мини-S3.
+
 Дополнительно всё проверено на реальном бакете Спринтбокса: загрузка (в том числе
 multipart для файла 12 МБ), повторный запуск без изменений, обновление файла по
 размеру, удаление исчезнувшего объекта, `--checksum` для правки того же размера,
@@ -374,3 +385,7 @@ multipart для файла 12 МБ), повторный запуск без и�
 к реальному endpoint проверено и с фиктивными ключами: хранилище отвечает
 `403 AccessDenied` (то есть запрос разобран корректно) в обоих стилях адресации —
 `path` и `virtual`.
+
+## Лицензия
+
+MIT — см. [LICENSE](LICENSE).
