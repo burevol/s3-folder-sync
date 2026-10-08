@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import itertools
 import os
 import shutil
@@ -19,6 +21,7 @@ import subprocess
 import sys
 import time
 import unittest
+from collections import namedtuple
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -40,6 +43,27 @@ ACCESS_KEY = "test-access-key"
 SECRET_KEY = "test-secret-key"
 REGION = "spb"
 PREFIX = "backup/data"
+
+# Результат запуска скрипта в текущем процессе: повторяет поля CompletedProcess
+# там, где дочерний процесс не подходит (см. run_sync_inprocess).
+InProcessResult = namedtuple("InProcessResult", "returncode stderr")
+
+
+def load_s3_sync():
+    """Загружает s3_sync.py как модуль — нужен тестам, подменяющим файловые вызовы."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("s3_sync_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Без регистрации в sys.modules падает @dataclass: он ищет модуль по имени.
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
 
 
 class SyncEndToEndTest(unittest.TestCase):
@@ -106,7 +130,7 @@ prefix = "{PREFIX}"
 """
         self.config.write_text(body, encoding="utf-8")
 
-    def run_sync(self, *extra: str, env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    def run_sync(self, *extra: str, env_overrides: dict[str, str | None] | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
             env.pop(name, None)
@@ -119,7 +143,13 @@ prefix = "{PREFIX}"
         if extra_paths:
             env["PYTHONPATH"] = os.pathsep.join(extra_paths + [env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
         if env_overrides:
-            env.update(env_overrides)
+            # Значение None убирает переменную: нужно там, где проверяется
+            # приоритет источников (S3_SYNC_* перебивает AWS_*).
+            for name, value in env_overrides.items():
+                if value is None:
+                    env.pop(name, None)
+                else:
+                    env[name] = value
         return subprocess.run(
             [sys.executable, str(SCRIPT), "--config", str(self.config), *extra],
             capture_output=True,
@@ -128,6 +158,43 @@ prefix = "{PREFIX}"
             env=env,
             timeout=180,
         )
+
+    def run_sync_inprocess(self, *extra: str, fail_read_for: str | None = None) -> InProcessResult:
+        """Запускает s3_sync.main() в текущем процессе и перехватывает его stderr.
+
+        Нужен там, где сбой файловой системы иначе не воспроизвести: вызовы
+        os.stat/os.lstat для указанного файла начинают падать с OSError — так
+        выглядит ошибка прав доступа или сбой сетевой ФС.
+        """
+        module = load_s3_sync()
+        env_backup = dict(os.environ)
+        real_stat, real_lstat = os.stat, os.lstat
+
+        def broken(original):
+            def wrapper(path, *args, **kwargs):
+                if str(path).replace("\\", "/").endswith(fail_read_for):
+                    raise OSError(13, "Permission denied")
+                return original(path, *args, **kwargs)
+
+            return wrapper
+
+        for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+            os.environ.pop(name, None)
+        os.environ["S3_SYNC_ACCESS_KEY"] = ACCESS_KEY
+        os.environ["S3_SYNC_SECRET_KEY"] = SECRET_KEY
+        if fail_read_for:
+            os.stat = broken(real_stat)
+            os.lstat = broken(real_lstat)
+
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                code = module.main(["--config", str(self.config), *extra])
+        finally:
+            os.stat, os.lstat = real_stat, real_lstat
+            os.environ.clear()
+            os.environ.update(env_backup)
+        return InProcessResult(returncode=code, stderr=buffer.getvalue())
 
     def make_file(self, relpath: str, content: str | bytes, mtime: float | None = None) -> Path:
         path = self.local / relpath
@@ -352,6 +419,127 @@ prefix = "backups/site"
         completed = self.run_sync("--skip-missing")
         self.assertEqual(completed.returncode, 2)
         self.assertIn("не осталось ни одной папки", completed.stderr)
+
+    # -- регрессии: предохранители против потери данных ----------------------
+
+    def test_15_folder_without_prefix_conflicts_with_prefixed_folder(self):
+        """Папка без префикса покрывает весь бакет, поэтому рядом с чужим префиксом — отказ."""
+        self.make_file("a.txt", "aaa")
+        self.client.put_object(Bucket=BUCKET, Key="backups/site/keep.txt", Body=b"keep")
+        self.write_config(
+            body=f"""
+[storage]
+endpoint_url = "{self.endpoint}"
+region = "{REGION}"
+bucket = "{BUCKET}"
+
+[[folders]]
+name = "whole-bucket"
+local = "{self.local.as_posix()}"
+
+[[folders]]
+name = "site"
+local = "{self.local.as_posix()}"
+prefix = "backups/site"
+"""
+        )
+        completed = self.run_sync()
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertIn("без префикса", completed.stderr)
+        self.assertIn(
+            "backups/site/keep.txt",
+            self.remote(),
+            "конфигурация должна отклоняться до любых удалений в бакете",
+        )
+
+    def test_16_no_env_credentials_ignores_aws_env(self):
+        """--no-env-credentials отключает и стандартные AWS_*, а не только S3_SYNC_*."""
+        self.write_config(
+            body=f"""
+[storage]
+endpoint_url = "{self.endpoint}"
+region = "{REGION}"
+bucket = "{BUCKET}"
+access_key = "CONFIGKEY123"
+secret_key = "CONFIGSECRET123"
+"""
+        )
+        # S3_SYNC_* проверяются раньше AWS_*, поэтому здесь их убираем: иначе
+        # до стандартных AWS_* дело просто не дойдёт.
+        env_overrides = {
+            "S3_SYNC_ACCESS_KEY": None,
+            "S3_SYNC_SECRET_KEY": None,
+            "AWS_ACCESS_KEY_ID": "ENVKEY456",
+            "AWS_SECRET_ACCESS_KEY": "ENVSECRET456",
+        }
+
+        # Без флага приоритет у окружения — это штатное поведение.
+        without_flag = self.run_sync("--check", env_overrides=env_overrides)
+        self.assertEqual(without_flag.returncode, 0, without_flag.stderr)
+        self.assertIn("ENVK…456", without_flag.stderr)
+
+        # С флагом ключи берутся из конфига, ключи окружения игнорируются.
+        with_flag = self.run_sync("--check", "--no-env-credentials", env_overrides=env_overrides)
+        self.assertEqual(with_flag.returncode, 0, with_flag.stderr)
+        self.assertIn("CONF…123", with_flag.stderr)
+        self.assertNotIn("ENVK…456", with_flag.stderr)
+
+    def test_17_unreadable_local_file_blocks_deletion(self):
+        """Ошибка чтения при обходе не должна приводить к удалению объекта из хранилища."""
+        self.make_file("a.txt", "aaa")
+        self.make_file("b.txt", "bbb")
+        self.write_config()
+        self.assertEqual(self.run_sync().returncode, 0)
+
+        result = self.run_sync_inprocess(fail_read_for="b.txt")
+        self.assertNotEqual(result.returncode, 0, "неполный обход обязан сообщаться как ошибка")
+        self.assertIn("не удалось прочитать", result.stderr)
+        self.assertEqual(sorted(self.remote()), [f"{PREFIX}/a.txt", f"{PREFIX}/b.txt"])
+
+    def test_18_unreadable_local_file_with_force_deletes_and_warns(self):
+        """--force снимает предохранитель: удаление выполняется, но предупреждение остаётся."""
+        self.make_file("a.txt", "aaa")
+        self.make_file("b.txt", "bbb")
+        self.write_config()
+        self.assertEqual(self.run_sync().returncode, 0)
+
+        result = self.run_sync_inprocess("--force", fail_read_for="b.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--force", result.stderr)
+        self.assertEqual(sorted(self.remote()), [f"{PREFIX}/a.txt"])
+
+    def test_19_unreadable_directory_is_reported(self):
+        """Нечитаемый каталог не должен молча выпадать из обхода."""
+        module = load_s3_sync()
+        locked = self.local / "locked"
+        locked.mkdir()
+        real_walk = os.walk
+
+        def fake_walk(root, *, followlinks=False, onerror=None):
+            if onerror is not None:
+                onerror(OSError(13, "Permission denied", str(locked)))
+            return iter(())
+
+        unreadable: list[str] = []
+        os.walk = fake_walk
+        try:
+            files = module.collect_local(self.local, (), unreadable=unreadable)
+        finally:
+            os.walk = real_walk
+        self.assertEqual(files, {})
+        self.assertEqual(unreadable, ["locked"])
+
+    def test_20_unreadable_file_with_no_delete_only_warns(self):
+        """Без удаления неполный обход ничем не грозит: предупреждение есть, код возврата нулевой."""
+        self.make_file("a.txt", "aaa")
+        self.make_file("b.txt", "bbb")
+        self.write_config()
+        self.assertEqual(self.run_sync().returncode, 0)
+
+        result = self.run_sync_inprocess("--no-delete", fail_read_for="b.txt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("обход неполный", result.stderr)
+        self.assertEqual(sorted(self.remote()), [f"{PREFIX}/a.txt", f"{PREFIX}/b.txt"])
 
 
 if __name__ == "__main__":

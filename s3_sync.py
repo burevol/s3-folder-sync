@@ -379,39 +379,39 @@ def load_settings(args: argparse.Namespace) -> Settings:
         raise ConfigError("addressing_style: допустимы только path, virtual или auto")
     signature_version = str(storage.get("signature_version") or "s3v4").strip()
 
-    # --no-env-credentials отключает и стандартные AWS_*, и собственные S3_SYNC_*.
-    key_env_prefix = [] if args.no_env_credentials else [f"{ENV_PREFIX}ACCESS_KEY"]
-    secret_env_prefix = [] if args.no_env_credentials else [f"{ENV_PREFIX}SECRET_KEY"]
-    token_env_prefix = [] if args.no_env_credentials else [f"{ENV_PREFIX}SESSION_TOKEN"]
-    profile_env_prefix = [] if args.no_env_credentials else [f"{ENV_PREFIX}PROFILE"]
+    # --no-env-credentials отключает и стандартные AWS_*, и собственные S3_SYNC_*:
+    # иначе ключи из окружения по-прежнему перебивали бы ключи из конфига, и флаг
+    # не защищал бы от чужих AWS_* (см. тест test_16).
+    def credential_env(*names: str) -> list[str]:
+        return [] if args.no_env_credentials else list(names)
 
     access_key, access_key_source = _pick(
         args.access_key,
-        [*key_env_prefix, "AWS_ACCESS_KEY_ID"],
+        credential_env(f"{ENV_PREFIX}ACCESS_KEY", "AWS_ACCESS_KEY_ID"),
         storage.get("access_key"),
         "конфигурационный файл (не рекомендуется)",
     )
     secret_key, secret_key_source = _pick(
         args.secret_key,
-        [*secret_env_prefix, "AWS_SECRET_ACCESS_KEY"],
+        credential_env(f"{ENV_PREFIX}SECRET_KEY", "AWS_SECRET_ACCESS_KEY"),
         storage.get("secret_key"),
         "конфигурационный файл (не рекомендуется)",
     )
     session_token, _ = _pick(
         args.session_token,
-        [*token_env_prefix, "AWS_SESSION_TOKEN"],
+        credential_env(f"{ENV_PREFIX}SESSION_TOKEN", "AWS_SESSION_TOKEN"),
         storage.get("session_token"),
         "конфигурационный файл",
     )
     profile, profile_source = _pick(
         args.profile,
-        [*profile_env_prefix, "AWS_PROFILE"],
+        credential_env(f"{ENV_PREFIX}PROFILE", "AWS_PROFILE"),
         storage.get("profile"),
         "конфигурационный файл",
     )
     credentials_file, _ = _pick(
         args.credentials_file,
-        [f"{ENV_PREFIX}CREDENTIALS_FILE", "AWS_SHARED_CREDENTIALS_FILE"],
+        credential_env(f"{ENV_PREFIX}CREDENTIALS_FILE", "AWS_SHARED_CREDENTIALS_FILE"),
         storage.get("credentials_file"),
         "конфигурационный файл",
     )
@@ -493,7 +493,16 @@ def load_settings(args: argparse.Namespace) -> Settings:
                 f"папки «{outer.name}» и «{inner.name}» используют один префикс {outer.prefix!r}; "
                 "объедините их или задайте разные префиксы"
             )
-        if outer.prefix and inner.prefix.startswith(outer.prefix + "/"):
+        if not outer.prefix:
+            # Пустой префикс — это весь бакет, поэтому любой непустой префикс лежит
+            # «внутри» него: папка без префикса считала бы чужими объектами всё, что
+            # не совпало с её локальными файлами, и удаляла бы их.
+            raise ConfigError(
+                f"папка «{outer.name}» без префикса синхронизирует весь бакет, а префикс {inner.prefix!r} "
+                f"(папка «{inner.name}») вложен в него; при синхронизации с удалением они будут мешать "
+                "друг другу — задайте первой папке непустой префикс или уберите вторую папку"
+            )
+        if inner.prefix.startswith(outer.prefix + "/"):
             raise ConfigError(
                 f"префикс {inner.prefix!r} (папка «{inner.name}») вложен в префикс {outer.prefix!r} "
                 f"(папка «{outer.name}»); при синхронизации с удалением они будут мешать друг другу — "
@@ -620,12 +629,40 @@ def explain_client_error(exc: Exception, settings: Settings) -> str:
 # ---------------------------------------------------------------------------
 
 
-def collect_local(root: Path, excludes: Sequence[str], *, follow_symlinks: bool = False) -> dict[str, LocalFile]:
+def collect_local(
+    root: Path,
+    excludes: Sequence[str],
+    *,
+    follow_symlinks: bool = False,
+    unreadable: list[str] | None = None,
+) -> dict[str, LocalFile]:
+    """Обходит локальную папку и возвращает карту «относительный путь → файл».
+
+    `unreadable` — необязательный накопитель относительных путей, которые не
+    удалось прочитать (файл или каталог). Вызывающий код обязан считать такой
+    обход неполным: нечитаемый файл просто отсутствует в результате и выглядит
+    как удалённый локально, поэтому по нему нельзя удалять объект из хранилища.
+    """
     files: dict[str, LocalFile] = {}
     if not root.is_dir():
         raise SyncError(f"локальная папка не найдена: {root}")
 
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks):
+    def report_unreadable(target: str | None, exc: OSError) -> None:
+        rel = ""
+        if target:
+            try:
+                rel = Path(target).relative_to(root).as_posix()
+            except ValueError:  # путь вне root — показываем как есть
+                rel = str(target)
+        if unreadable is not None and rel:
+            unreadable.append(rel)
+        LOG.warning("не удалось прочитать %s: %s", rel or target, exc)
+
+    def on_walk_error(exc: OSError) -> None:
+        # os.walk по умолчанию молча пропускает нечитаемый каталог целиком.
+        report_unreadable(getattr(exc, "filename", None), exc)
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=follow_symlinks, onerror=on_walk_error):
         current = Path(dirpath)
         rel_dir = "" if current == root else current.relative_to(root).as_posix()
 
@@ -647,7 +684,7 @@ def collect_local(root: Path, excludes: Sequence[str], *, follow_symlinks: bool 
             try:
                 st = full.stat() if follow_symlinks else full.lstat()
             except OSError as exc:
-                LOG.warning("не удалось прочитать %s: %s", rel, exc)
+                report_unreadable(str(full), exc)
                 continue
             if not follow_symlinks and stat_module.S_ISLNK(st.st_mode):
                 LOG.debug("символическая ссылка пропущена: %s", rel)
@@ -855,8 +892,14 @@ def run_sync(
 
     for folder in folders:
         LOG.info("папка «%s»: %s -> s3://%s/%s", folder.name, folder.local, settings.bucket, folder.prefix)
+        unreadable: list[str] = []
         try:
-            local_files = collect_local(folder.local, folder.excludes, follow_symlinks=args.follow_symlinks)
+            local_files = collect_local(
+                folder.local,
+                folder.excludes,
+                follow_symlinks=args.follow_symlinks,
+                unreadable=unreadable,
+            )
         except SyncError as exc:
             problems.append(str(exc))
             LOG.error("%s", exc)
@@ -872,7 +915,26 @@ def run_sync(
             tolerance=args.tolerance,
         )
 
-        if not local_files and remote_objects and folder.delete and not args.force:
+        if unreadable:
+            preview = ", ".join(sorted(unreadable)[:3])
+            suffix = f" и ещё {len(unreadable) - 3}" if len(unreadable) > 3 else ""
+            where = f"папка «{folder.name}»: не удалось прочитать {len(unreadable)} запись(ей) при обходе ({preview}{suffix})"
+            if folder.delete and not args.force:
+                # Нечитаемый файл выглядит как удалённый локально: без этой проверки
+                # его объект сносился бы из хранилища по неполному обходу.
+                message = (
+                    f"{where}. Удаление отменено — по неполному обходу удалять нельзя. "
+                    "Разберитесь с правами доступа или запустите с --force"
+                )
+                problems.append(message)
+                LOG.error("%s", message)
+                kept += len(deletes)
+                deletes = []
+            elif folder.delete:
+                LOG.warning("%s; обход неполный, но --force отключает предохранитель — удаление выполнено", where)
+            else:
+                LOG.warning("%s; обход неполный, часть файлов не попала в план загрузки", where)
+        elif not local_files and remote_objects and folder.delete and not args.force:
             message = (
                 f"папка «{folder.name}» ({folder.local}) пуста, а в хранилище {len(remote_objects)} объектов. "
                 "Удаление отменено — проверьте пути; чтобы удалить всё равно, запустите с --force"
