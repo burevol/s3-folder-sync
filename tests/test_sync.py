@@ -16,6 +16,7 @@ import contextlib
 import io
 import itertools
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,7 @@ PREFIX = "backup/data"
 
 # Результат запуска скрипта в текущем процессе: повторяет поля CompletedProcess
 # там, где дочерний процесс не подходит (см. run_sync_inprocess).
-InProcessResult = namedtuple("InProcessResult", "returncode stderr")
+InProcessResult = namedtuple("InProcessResult", "returncode stderr read_failures")
 
 
 def load_s3_sync():
@@ -162,19 +163,26 @@ prefix = "{PREFIX}"
     def run_sync_inprocess(self, *extra: str, fail_read_for: str | None = None) -> InProcessResult:
         """Запускает s3_sync.main() в текущем процессе и перехватывает его stderr.
 
-        Нужен там, где сбой файловой системы иначе не воспроизвести: вызовы
-        os.stat/os.lstat для указанного файла начинают падать с OSError — так
-        выглядит ошибка прав доступа или сбой сетевой ФС.
+        Нужен там, где сбой файловой системы иначе не воспроизвести: чтение
+        указанного файла начинает падать с OSError — так выглядит ошибка прав
+        доступа или сбой сетевой ФС.
+
+        Подменяются методы pathlib.Path, а не os.stat/os.lstat: до Python 3.11
+        pathlib копирует os.stat в атрибуты собственного _Accessor ещё при
+        импорте, поэтому подмена os.* до кода под тестом не доходит — на 3.10
+        эти тесты молча ничего не проверяли и падали в CI.
         """
         module = load_s3_sync()
         env_backup = dict(os.environ)
-        real_stat, real_lstat = os.stat, os.lstat
+        real_path_stat, real_path_lstat = pathlib.Path.stat, pathlib.Path.lstat
+        read_failures: list[str] = []
 
         def broken(original):
-            def wrapper(path, *args, **kwargs):
-                if str(path).replace("\\", "/").endswith(fail_read_for):
+            def wrapper(self, *args, **kwargs):
+                if str(self).replace("\\", "/").endswith(fail_read_for):
+                    read_failures.append(str(self))
                     raise OSError(13, "Permission denied")
-                return original(path, *args, **kwargs)
+                return original(self, *args, **kwargs)
 
             return wrapper
 
@@ -183,18 +191,22 @@ prefix = "{PREFIX}"
         os.environ["S3_SYNC_ACCESS_KEY"] = ACCESS_KEY
         os.environ["S3_SYNC_SECRET_KEY"] = SECRET_KEY
         if fail_read_for:
-            os.stat = broken(real_stat)
-            os.lstat = broken(real_lstat)
+            pathlib.Path.stat = broken(real_path_stat)
+            pathlib.Path.lstat = broken(real_path_lstat)
 
         buffer = io.StringIO()
         try:
             with contextlib.redirect_stderr(buffer):
                 code = module.main(["--config", str(self.config), *extra])
         finally:
-            os.stat, os.lstat = real_stat, real_lstat
+            pathlib.Path.stat, pathlib.Path.lstat = real_path_stat, real_path_lstat
             os.environ.clear()
             os.environ.update(env_backup)
-        return InProcessResult(returncode=code, stderr=buffer.getvalue())
+        return InProcessResult(
+            returncode=code,
+            stderr=buffer.getvalue(),
+            read_failures=len(read_failures),
+        )
 
     def make_file(self, relpath: str, content: str | bytes, mtime: float | None = None) -> Path:
         path = self.local / relpath
@@ -492,6 +504,7 @@ secret_key = "CONFIGSECRET123"
         self.assertEqual(self.run_sync().returncode, 0)
 
         result = self.run_sync_inprocess(fail_read_for="b.txt")
+        self.assertGreater(result.read_failures, 0, "подмена чтения не сработала — тест ничего не проверяет")
         self.assertNotEqual(result.returncode, 0, "неполный обход обязан сообщаться как ошибка")
         self.assertIn("не удалось прочитать", result.stderr)
         self.assertEqual(sorted(self.remote()), [f"{PREFIX}/a.txt", f"{PREFIX}/b.txt"])
@@ -504,6 +517,7 @@ secret_key = "CONFIGSECRET123"
         self.assertEqual(self.run_sync().returncode, 0)
 
         result = self.run_sync_inprocess("--force", fail_read_for="b.txt")
+        self.assertGreater(result.read_failures, 0, "подмена чтения не сработала — тест ничего не проверяет")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--force", result.stderr)
         self.assertEqual(sorted(self.remote()), [f"{PREFIX}/a.txt"])
@@ -537,6 +551,7 @@ secret_key = "CONFIGSECRET123"
         self.assertEqual(self.run_sync().returncode, 0)
 
         result = self.run_sync_inprocess("--no-delete", fail_read_for="b.txt")
+        self.assertGreater(result.read_failures, 0, "подмена чтения не сработала — тест ничего не проверяет")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("обход неполный", result.stderr)
         self.assertEqual(sorted(self.remote()), [f"{PREFIX}/a.txt", f"{PREFIX}/b.txt"])
